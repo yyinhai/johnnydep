@@ -1,7 +1,7 @@
 import sys
 
 import pytest
-from pip.exceptions import DistributionNotFound
+from pip._internal.exceptions import DistributionNotFound
 from testfixtures import ShouldRaise
 
 from johnnydep.lib import JohnnyDist
@@ -15,12 +15,12 @@ def test_version_nonexisting():
 
 
 def test_version_conflict():
-    # wheel v0.30.0 is already installed, but v0.29.0 does exist in index
-    dist = JohnnyDist('wheel<0.30.0')
-    assert dist.version_installed == '0.30.0'
-    assert dist.version_latest == '0.30.0'
-    assert dist.versions_available == ['0.29.0', '0.30.0']
-    assert dist.version_latest_in_spec == '0.29.0'
+    # wimpy v0.3 is already installed, but v0.2 does exist in index
+    dist = JohnnyDist('wimpy<0.3')
+    assert dist.version_installed == '0.3'
+    assert dist.version_latest == '0.3'
+    assert dist.versions_available == ['0.2', '0.3']
+    assert dist.version_latest_in_spec == '0.2'
 
 
 def test_build_from_sdist():

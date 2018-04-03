@@ -7,6 +7,7 @@ import os
 import sys
 from collections import defaultdict
 from collections import OrderedDict
+from email.parser import HeaderParser
 from tempfile import NamedTemporaryFile
 from zipfile import ZipFile
 
@@ -16,11 +17,9 @@ import pkg_resources
 import pytoml
 import wimpy
 from cachetools.func import ttl_cache
-from pip.index import canonicalize_name
-from pip.req.req_install import Marker
+from packaging.utils import canonicalize_name
+from packaging.markers import Marker
 from structlog import get_logger
-from wheel.metadata import pkginfo_to_dict
-from wheel.util import OrderedDefaultDict
 from wimpy import cached_property
 
 from johnnydep import pipper
@@ -34,6 +33,12 @@ DEFAULT_INDEX = 'https://pypi.python.org/simple'
 
 if sys.version_info < (3,):
     oyaml.add_representer(unicode, lambda d, s: oyaml.ScalarNode(tag=u'tag:yaml.org,2002:str', value=s))
+
+
+class OrderedDefaultListDict(OrderedDict):
+    def __missing__(self, key):
+        self[key] = value = []
+        return value
 
 
 class JohnnyDist(anytree.NodeMixin):
@@ -121,11 +126,24 @@ class JohnnyDist(anytree.NodeMixin):
         except ValueError:
             self.log.debug('json meta absent, try pkginfo')
             [metadata_fname] = [x for x in self.namelist if x.endswith('METADATA') or x.endswith('PKG-INFO')]
-            with NamedTemporaryFile(mode='w') as f:
+            with NamedTemporaryFile(mode='r+') as f:
                 f.write(self.read(metadata_fname))
                 f.flush()
-                data = pkginfo_to_dict(f.name)
-            data.default_factory = None  # disables defaultdict, restoring KeyErrors
+                f.seek(0)
+                raw_data = HeaderParser().parse(f)
+            # https://www.python.org/dev/peps/pep-0566/#json-compatible-metadata
+            data = {}
+            for k, v in raw_data.items():
+                k = k.lower().replace('-', '_')
+                try:
+                    data[k].append(v)
+                except KeyError:
+                    data[k] = v
+                except AttributeError:
+                    data[k] = [data[k], v]
+            if 'keywords' in data:
+                data['keywords'] = data['keywords'].split()
+            # TODO: consider using from wheel.metadata import pkginfo_to_metadata
         else:
             data = json.loads(self.read(metadata_fname))
         return data
@@ -135,20 +153,32 @@ class JohnnyDist(anytree.NodeMixin):
         """Just the strings (name and spec) for my immediate dependencies. Cheap."""
         # TODO : gets for other env / cross-compat?
         result = []
-        for d in self.metadata.get('run_requires', {}):
-            if 'extra' in d:
-                include = d['extra'] in self.extras_requested
-                msg = ('adding' if include else 'ignored') + ' reqs for extra'
-                self.log.debug(msg, extra=d['extra'], requires=d['requires'])
-                if not include:
-                    continue
-            if 'environment' in d:
-                include = Marker(d['environment']).evaluate()
+        if self.metadata.get('run_requires'):
+            for d in self.metadata.get('run_requires', {}):
+                if 'extra' in d:
+                    include = d['extra'] in self.extras_requested
+                    msg = ('adding' if include else 'ignored') + ' reqs for extra'
+                    self.log.debug(msg, extra=d['extra'], requires=d['requires'])
+                    if not include:
+                        continue
+                if 'environment' in d:
+                    include = Marker(d['environment']).evaluate()
+                    msg = ('adding' if include else 'ignored') + ' platform specific reqs'
+                    self.log.debug(msg, env=d['environment'], requires=d['requires'])
+                    if not include:
+                        continue
+                result.extend(d['requires'])
+        else:
+            reqs = self.metadata.get('requires_dist', [])
+            if not isinstance(reqs, list):
+                reqs = [reqs]
+            for req in reqs:
+                name, sep, marker = req.partition(';')
+                include = Marker(marker).evaluate()
                 msg = ('adding' if include else 'ignored') + ' platform specific reqs'
-                self.log.debug(msg, env=d['environment'], requires=d['requires'])
-                if not include:
-                    continue
-            result.extend(d['requires'])
+                self.log.debug(msg, env=marker, requires=name)
+                if include:
+                    result.append(name)
         result = sorted(set(result))  # this makes the dep tree deterministic/repeatable
         return result
 
@@ -164,6 +194,10 @@ class JohnnyDist(anytree.NodeMixin):
 
     @property
     def homepage(self):
+        try:
+            return self.metadata['home_page']
+        except KeyError:
+            pass
         for k in 'python.details', 'python.project':
             try:
                 return self.metadata['extensions'][k]['project_urls']['Home']
@@ -173,7 +207,8 @@ class JohnnyDist(anytree.NodeMixin):
 
     @property
     def summary(self):
-        return self.metadata.get('summary').lstrip('#').strip()
+        text = self.metadata.get('summary') or self.metadata.get('Summary')
+        return text.lstrip('#').strip()
 
     @cached_property
     def versions_available(self):
@@ -282,7 +317,7 @@ def gen_table(johnnydist, extra_cols=()):
 
 def flatten_deps(johnnydist):
     johnnydist.log.debug('resolving dep tree')
-    dist_map = OrderedDefaultDict(list)
+    dist_map = OrderedDefaultListDict()
     spec_map = defaultdict(str)
     extra_map = defaultdict(set)
     required_by_map = defaultdict(list)

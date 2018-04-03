@@ -10,12 +10,15 @@ import sys
 from argparse import ArgumentParser
 
 import pip
-import pip.index
 import pkg_resources
 import testfixtures
-from pip.download import PipSession
-from pip.req.req_install import InstallRequirement
-from pip.req.req_install import Requirement
+from packaging.utils import canonicalize_name
+from pip._internal.commands.wheel import WheelCommand
+from pip._internal.download import PipSession
+from pip._internal.exceptions import DistributionNotFound
+from pip._internal.index import PackageFinder
+from pip._internal.req.req_install import InstallRequirement
+from pip._internal.req.req_install import Requirement
 from cachetools.func import ttl_cache
 from structlog import get_logger
 
@@ -41,13 +44,13 @@ def compute_checksum(target, algorithm='sha256', blocksize=2**13):
 def get_versions(dist_name, index_url=DEFAULT_INDEX):
     bare_name = Requirement(dist_name).name
     log.debug('checking versions available', dist=bare_name)
-    wheel_cmd = pip.commands.wheel.WheelCommand()
+    wheel_cmd = WheelCommand()
     wheel_args = ['--no-deps', '--no-cache-dir', '--index-url', index_url, bare_name + '==showmethemoney']
     options, args = wheel_cmd.parse_args(wheel_args)
     with testfixtures.LogCapture(level=logging.INFO) as log_capture, testfixtures.OutputCapture():
         try:
             wheel_cmd.run(options, args)
-        except pip.exceptions.DistributionNotFound:
+        except DistributionNotFound:
             # expected.  we forced this by using a non-existing version number.
             pass
     msg = 'Could not find a version that satisfies the requirement %s (from versions: %s)'
@@ -58,10 +61,9 @@ def get_versions(dist_name, index_url=DEFAULT_INDEX):
 
 @ttl_cache(maxsize=512, ttl=60*5)
 def get_link(dist_name, index_url=DEFAULT_INDEX):
-    req = pkg_resources.Requirement.parse(dist_name)
-    install_req = InstallRequirement(req=req, comes_from=None)
+    install_req = InstallRequirement.from_req(req=dist_name, comes_from=None)
     with PipSession(retries=5) as session:
-        finder = pip.index.PackageFinder(find_links=(), index_urls=[index_url], session=session)
+        finder = PackageFinder(find_links=(), index_urls=[index_url], session=session)
         result = finder.find_requirement(install_req, upgrade=True)
     url, sep, checksum = result.url.partition('#')
     assert url == result.url_without_fragment
@@ -73,17 +75,14 @@ def get_link(dist_name, index_url=DEFAULT_INDEX):
 
 
 def get(dist_name, index_url=DEFAULT_INDEX):
-    wheel_cmd = pip.commands.wheel.WheelCommand()
-    wheel_args = ['--no-deps', '--no-cache-dir', '--index-url', index_url, dist_name]
+    wheel_cmd = WheelCommand()
+    wheel_args = ['--no-deps', '--no-cache-dir', '--index-url', index_url, '--progress-bar=off', dist_name]
     options, args = wheel_cmd.parse_args(wheel_args)
     log.debug('wheeling and dealing', cmd=' '.join(wheel_args))
     log_capture = testfixtures.LogCapture(level=logging.INFO)
     output_capture = testfixtures.OutputCapture()
-    # Waiting on pip 9.1 here
-    #   https://github.com/pypa/pip/pull/4194
-    pip_progress = 'pip.utils.ui.DownloadProgressBar.file'
     try:
-        with log_capture, output_capture, open(os.devnull, 'w') as shhh, testfixtures.Replace(pip_progress, shhh):
+        with log_capture, output_capture:
             wheel_cmd.run(options, args)
     except Exception:
         for record in log_capture.records:
@@ -111,7 +110,7 @@ def get(dist_name, index_url=DEFAULT_INDEX):
             whl = max(whls, key=lambda whl: os.stat(whl).st_mtime)
             required_spec = Requirement(dist_name).specifier
             name, version, the_rest = os.path.basename(whl).split('-', 2)
-            name_match = pip.index.canonicalize_name(name) == pip.index.canonicalize_name(install_req.req.name)
+            name_match = canonicalize_name(name) == canonicalize_name(install_req.req.name)
             if not name_match or version not in required_spec:
                 # wat - the most recently modified wheel is not up to spec?  I think this can never happen ...
                 raise Exception('Something strange happened')
@@ -124,9 +123,6 @@ def get(dist_name, index_url=DEFAULT_INDEX):
         raise Exception("No .whl")
     if '.cache/pip/wheels' in url:
         # wat? using --no-cache-dir should have prevented this possibility
-        # consider LogCapture at level DEBUG and capture the cached link (which may have been sdist)
-        # start digging in pip.req.req_install.py:InstallRequirement.populate_link
-        # If that doesn't work, might have to look at using pip.index.py:PackageFinder directly
         raise Exception('url is cached ... fixme')
     if not checksum:
         # this can happen, for example, if wheel dug a file out of the pip cache instead of downloading it
